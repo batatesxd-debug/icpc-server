@@ -1,29 +1,26 @@
 const express = require("express");
-const cors    = require("cors");
-const admin   = require("firebase-admin");
-const fetch   = require("node-fetch");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const fetch = require("node-fetch");
 
-// ─────────────────────────────────────────────
-// INIT
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// INIT APP
+// ─────────────────────────────
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
 
-// Firebase Admin — بيستخدم GOOGLE_APPLICATION_CREDENTIALS env var
-// أو serviceAccountKey.json لو موجود
-let serviceAccount;
-try {
- admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-  })
-});
-} catch {
-  // على Render: حط GOOGLE_APPLICATION_CREDENTIALS كـ env var
-  admin.initializeApp();
+// ─────────────────────────────
+// FIREBASE ADMIN INIT
+// ─────────────────────────────
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+    }),
+  });
 }
 
 const db = admin.firestore();
