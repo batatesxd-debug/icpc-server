@@ -1,13 +1,7 @@
 const express = require("express");
-const cors    = require("cors");
-const admin   = require("firebase-admin");
-const fs      = require("fs");
-const path    = require("path");
-const os      = require("os");
-const { execFile, spawn } = require("child_process");
-const { promisify } = require("util");
-
-const execFileAsync = promisify(execFile);
+const cors = require("cors");
+const admin = require("firebase-admin");
+const fetch = require("node-fetch");
 
 // ─────────────────────────────
 // INIT APP
@@ -22,9 +16,9 @@ app.use(express.json());
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
-      projectId:   process.env.FIREBASE_PROJECT_ID,
+      projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
     }),
   });
 }
@@ -34,116 +28,54 @@ const db = admin.firestore();
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
-const RATE_LIMIT_MS  = 3000;
-const TIME_LIMIT_MS  = 5000;   // وقت تشغيل كل test case
-const MEM_LIMIT_MB   = 256;    // حد الميموري (ulimit)
-const MAX_OUTPUT_LEN = 100000; // أقصى حجم output (chars)
+const RATE_LIMIT_MS   = 3000;
+const WANDBOX_TIMEOUT = 10000;
 
 // ─────────────────────────────────────────────
-// LOCAL C++ RUNNER
+// WANDBOX
 // ─────────────────────────────────────────────
-async function localRun(code, stdin) {
-  // 1. اكتب الكود في ملف مؤقت
-  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), "judge-"));
-  const srcFile = path.join(tmpDir, "solution.cpp");
-  const binFile = path.join(tmpDir, "solution");
+async function wandboxRun(code, stdin) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WANDBOX_TIMEOUT);
 
   try {
-    fs.writeFileSync(srcFile, code);
-
-    // 2. Compile
-    try {
-      await execFileAsync("g++", [
-        "-std=c++17", "-O2",
-        "-o", binFile,
-        srcFile,
-      ], { timeout: 10000 });
-    } catch (compileErr) {
-      return {
-        stdout: "",
-        stderr: compileErr.stderr || compileErr.message,
-        exitCode: 1,
-        ce: true,
-      };
-    }
-
-    // 3. Run مع stdin + time limit + memory limit
-    const result = await runWithLimits(binFile, stdin || "");
-    return result;
-
+    const resp = await fetch("https://wandbox.org/api/compile.json", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code,
+        compiler: "gcc-head",
+        options: "-std=c++17 -O2",
+        stdin: stdin || "",
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) throw new Error(`Wandbox HTTP ${resp.status}`);
+    const data = await resp.json();
+    return {
+      stdout: data.program_output || "",
+      stderr: (data.compiler_error || "") + (data.program_error || ""),
+      code: parseInt(data.status) || 0,
+    };
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error("Time Limit Exceeded");
+    throw e;
   } finally {
-    // 4. نظّف الملفات المؤقتة دايمًا
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    clearTimeout(timer);
   }
-}
-
-function runWithLimits(binFile, stdin) {
-  return new Promise((resolve) => {
-    // ulimit -v لحد الميموري (KB)
-    const child = spawn("bash", [
-      "-c",
-      `ulimit -v ${MEM_LIMIT_MB * 1024} && exec "${binFile}"`,
-    ], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    let stdout = "", stderr = "";
-    let killed = false;
-
-    // Time limit
-    const timer = setTimeout(() => {
-      killed = true;
-      child.kill("SIGKILL");
-    }, TIME_LIMIT_MS);
-
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
-      // إلغاء لو الـ output كبير جدًا
-      if (stdout.length > MAX_OUTPUT_LEN) {
-        killed = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr.on("data", (d) => { stderr += d.toString(); });
-
-    if (stdin) {
-      child.stdin.write(stdin);
-      child.stdin.end();
-    } else {
-      child.stdin.end();
-    }
-
-    child.on("close", (exitCode) => {
-      clearTimeout(timer);
-      resolve({
-        stdout,
-        stderr,
-        exitCode: exitCode ?? 1,
-        tle: killed,
-        ce: false,
-      });
-    });
-
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ stdout: "", stderr: err.message, exitCode: 1, ce: false, tle: false });
-    });
-  });
 }
 
 // ─────────────────────────────────────────────
 // CLASSIFY
 // ─────────────────────────────────────────────
 function classifyResult(result, expectedOutput) {
-  if (result.ce)                           return "CE";
-  if (result.tle)                          return "TLE";
-  if (result.stderr && result.stderr.trim()) return "RE";
-  if (result.exitCode !== 0)               return "RE";
+  if (result.stderr && result.stderr.trim()) return "CE";
+  if (result.code !== 0)                     return "RE";
   return result.stdout.trim() === (expectedOutput || "").trim() ? "AC" : "WA";
 }
 
 // ─────────────────────────────────────────────
-// HEALTH CHECK
+// HEALTH CHECK (مهم على Render)
 // ─────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
@@ -175,8 +107,8 @@ app.post("/judgeSubmission", async (req, res) => {
 
   // ── 3. Rate limiting ──
   try {
-    const userRef    = db.collection("users").doc(uid);
-    const userSnap   = await userRef.get();
+    const userRef  = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
     const lastSubmit = userSnap.data()?.lastSubmit?.toMillis?.() || 0;
     if (Date.now() - lastSubmit < RATE_LIMIT_MS) {
       return res.status(429).json({ error: "Too many requests — wait a moment" });
@@ -200,9 +132,9 @@ app.post("/judgeSubmission", async (req, res) => {
   if (now < start) return res.status(403).json({ error: "Contest has not started yet" });
   if (now > end)   return res.status(403).json({ error: "Contest has ended" });
 
-  const isAdminUser  = contestData.admins?.includes(uid);
+  const isAdmin      = contestData.admins?.includes(uid);
   const isRegistered = contestData.registeredUsers?.includes(uid);
-  if (!isAdminUser && !isRegistered) {
+  if (!isAdmin && !isRegistered) {
     return res.status(403).json({ error: "You are not registered for this contest" });
   }
 
@@ -225,41 +157,20 @@ app.post("/judgeSubmission", async (req, res) => {
   const testcases  = hiddenTests.length ? hiddenTests : publicExamples;
   const totalTests = testcases.length || 1;
 
-  // ── 6. Compile مرة واحدة ──
-  // نعمل compile أول بأول مرة بس، وبعدين نشغّل على كل test case
-  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), "judge-"));
-  const srcFile = path.join(tmpDir, "solution.cpp");
-  const binFile = path.join(tmpDir, "solution");
-  let compileFailed = false, compileStderr = "";
-
-  try {
-    fs.writeFileSync(srcFile, code);
-    await execFileAsync("g++", ["-std=c++17", "-O2", "-o", binFile, srcFile], { timeout: 10000 });
-  } catch (compileErr) {
-    compileFailed  = true;
-    compileStderr  = compileErr.stderr || compileErr.message;
-  }
-
-  // ── 7. Judge ──
+  // ── 6. Judge ──
   let passedCount = 0, finalVerdict = "AC", verdictDesc = "Accepted";
   const publicCaseResults = [];
 
   try {
-    if (compileFailed) {
-      finalVerdict = "CE";
-      verdictDesc  = "Compile Error";
-    } else if (testcases.length) {
+    if (testcases.length) {
       for (const tc of testcases) {
-        const result  = await runWithLimits(binFile, tc.input || "");
-        result.ce     = false; // الـ compile نجح بالفعل
+        const result  = await wandboxRun(code, tc.input || "");
         const verdict = classifyResult(result, tc.output || tc.expectedOutput || "");
 
         if (verdict === "AC") passedCount++;
         else if (finalVerdict === "AC") {
           finalVerdict = verdict;
-          verdictDesc  =
-            verdict === "TLE" ? "Time Limit Exceeded" :
-            verdict === "RE"  ? "Runtime Error"       : "Wrong Answer";
+          verdictDesc  = verdict === "CE" ? "Compile Error" : verdict === "RE" ? "Runtime Error" : "Wrong Answer";
         }
 
         const isPublicExample = publicExamples.some(ex => ex.input === tc.input);
@@ -273,17 +184,17 @@ app.post("/judgeSubmission", async (req, res) => {
         }
       }
     } else {
-      // مفيش test cases — بس تأكد إنه اتـcompile (فوق نجح)
-      passedCount = 1;
+      const result = await wandboxRun(code, "");
+      finalVerdict = result.stderr?.trim() ? "CE" : "AC";
+      verdictDesc  = finalVerdict === "CE" ? "Compile Error" : "Accepted";
+      passedCount  = finalVerdict === "AC" ? 1 : 0;
     }
   } catch (e) {
-    finalVerdict = "ERR";
+    finalVerdict = e.message === "Time Limit Exceeded" ? "TLE" : "ERR";
     verdictDesc  = e.message;
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 
-  // ── 8. Write to Firestore ──
+  // ── 7. Write to Firestore ──
   try {
     await db
       .collection("contests").doc(contestId)
