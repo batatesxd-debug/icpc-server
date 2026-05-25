@@ -14,8 +14,13 @@ app.use(express.json());
 // أو serviceAccountKey.json لو موجود
 let serviceAccount;
 try {
-  serviceAccount = require("./serviceAccountKey.json");
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+ admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  })
+});
 } catch {
   // على Render: حط GOOGLE_APPLICATION_CREDENTIALS كـ env var
   admin.initializeApp();
